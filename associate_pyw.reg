@@ -1,0 +1,110 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================================
+; Associate .pyw files with pythonw.exe so double-clicking RUNS the script
+; instead of opening it in an IDE (IDLE, VS Code, PyCharm, etc.).
+;
+; The default handler uses the Python Launcher (py.exe) which ships with
+; Python 3.3+ and automatically finds any installed Python version.
+; Fallback entries cover common install paths for Python 3.8 – 3.13.
+;
+; Usage: right-click this file -> Merge, or double-click and confirm.
+; No admin required — writes to HKEY_CURRENT_USER only.
+; ============================================================================
+
+; --- Map .pyw extension to our handler ---
+[HKEY_CURRENT_USER\Software\Classes\.pyw]
+@="PywFile.Run"
+"Content Type"="text/x-python"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run]
+@="Python Script (windowless)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\DefaultIcon]
+@="C:\Windows\py.exe,0"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell]
+@="open"
+
+; --- Default: Python Launcher (works with ANY installed Python 3) ---
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\open]
+@="Run"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\open\command]
+@="\"C:\Windows\py.exe\" -w \"%1\" %*"
+
+; --- Fallbacks: system-wide installs (C:\PythonXXX) ---
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python313]
+@="Python 3.13"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python313\command]
+@="\"C:\Python313\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python312]
+@="Python 3.12"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python312\command]
+@="\"C:\Python312\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python311]
+@="Python 3.11"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python311\command]
+@="\"C:\Python311\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python310]
+@="Python 3.10"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python310\command]
+@="\"C:\Python310\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python39]
+@="Python 3.9"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python39\command]
+@="\"C:\Python39\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python38]
+@="Python 3.8"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python38\command]
+@="\"C:\Python38\pythonw.exe\" \"%1\" %*"
+
+; --- Fallbacks: Program Files installs ---
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python313PF]
+@="Python 3.13 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python313PF\command]
+@="\"C:\Program Files\Python313\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python312PF]
+@="Python 3.12 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python312PF\command]
+@="\"C:\Program Files\Python312\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python311PF]
+@="Python 3.11 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python311PF\command]
+@="\"C:\Program Files\Python311\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python310PF]
+@="Python 3.10 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python310PF\command]
+@="\"C:\Program Files\Python310\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python39PF]
+@="Python 3.9 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python39PF\command]
+@="\"C:\Program Files\Python39\pythonw.exe\" \"%1\" %*"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python38PF]
+@="Python 3.8 (Program Files)"
+
+[HKEY_CURRENT_USER\Software\Classes\PywFile.Run\shell\Python38PF\command]
+@="\"C:\Program Files\Python38\pythonw.exe\" \"%1\" %*"
