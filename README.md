@@ -8,20 +8,20 @@ An always-on-top desktop widget for Windows that monitors and manages multiple [
 
 ## Features
 
-- **Live session tracking** — automatically discovers active Claude Code sessions by monitoring `~/.claude/projects/` JSONL files and correlating them with running `claude.exe` processes via I/O write counters
-- **Real-time status indicators** — shows each session's state: `READY`, `THINKING`, `APPROVE?`, `REJECTED`, or `INTERRUPTED`
-- **Auto-approve** — automatically sends `Enter` to approve pending tool-use permission prompts (global toggle + per-session override)
-- **Click to focus** — click any session row to bring its terminal window to the foreground (uses `AttachConsole`/`SetForegroundWindow`, with `UIAutomation` tab-switching fallback in tab mode)
-- **Inline rename** — pencil icon opens an inline editor; commits via `/rename` to the Claude process and persists in `~/.claude/history.jsonl`
-- **Auto-rename** — new sessions are automatically renamed to their first user message so you can tell them apart at a glance
-- **Subagent display** — spawned subagents appear with a 🤖 prefix under their parent session
-- **New session launcher** — `+` button spawns a new Claude Code session in either window or tab mode, with a configurable working directory
-- **Window / Tab modes** — `WIN` mode opens each session in its own console window; `TAB` mode opens sessions as new Windows Terminal tabs
-- **Draggable & minimizable** — frameless, semi-transparent overlay you can drag anywhere; minimize to a single header row
+- **Live session tracking**: automatically discovers active Claude Code sessions by monitoring `~/.claude/projects/` JSONL files and correlating them with running `claude.exe` processes via I/O write counters
+- **Real-time status indicators**: shows each session's state: `READY`, `THINKING`, `APPROVE?`, `REJECTED`, or `INTERRUPTED`
+- **Auto-approve**: automatically sends `Enter` to approve pending tool-use permission prompts (global toggle + per-session override)
+- **Click to focus**: click any session row to bring its terminal window to the foreground (uses `AttachConsole`/`SetForegroundWindow`, with `UIAutomation` tab-switching fallback in tab mode)
+- **Inline rename**: pencil icon opens an inline editor; commits via `/rename` to the Claude process and persists in `~/.claude/history.jsonl`
+- **Auto-rename**: new sessions are automatically renamed to their first user message so you can tell them apart at a glance
+- **Subagent display**: spawned subagents appear with a 🤖 prefix under their parent session
+- **New session launcher**: `+` button spawns a new Claude Code session in either window or tab mode, with a configurable working directory
+- **Window / Tab modes**: `WIN` mode opens each session in its own console window; `TAB` mode opens sessions as new Windows Terminal tabs
+- **Draggable & minimizable**: frameless, semi-transparent overlay you can drag anywhere; minimize to a single header row
 
 ## Requirements
 
-- **Windows 10/11** (uses Win32 API via ctypes — no third-party dependencies)
+- **Windows 10/11** (uses Win32 API via ctypes: no third-party dependencies)
 - **Python 3.10+** (tested with 3.12)
 - **Claude Code CLI** installed and on `PATH`
 - **Windows Terminal** (optional, required for tab mode)
@@ -60,18 +60,18 @@ The widget appears in the top-right corner of your screen. It auto-discovers any
 
 ### How it works
 
-1. **Process discovery** — polls `tasklist` every 10 seconds to find `claude.exe` PIDs, then separates root processes from subagents by checking parent PIDs
-2. **Session matching** — scans `~/.claude/projects/` for recently modified `.jsonl` files and correlates them to PIDs using I/O write-operation deltas (`GetProcessIoCounters`)
-3. **Status detection** — reads the tail of each session's JSONL to determine the current state (last message type, stop reason, tool-use content blocks)
-4. **Auto-approve** — when a session shows `APPROVE?` status, injects an `Enter` keypress into the process's console input buffer via `WriteConsoleInputW` (falls back to `PostMessage WM_KEYDOWN`)
-5. **Focus** — uses `AttachConsole` + `GetConsoleWindow` + `SetForegroundWindow` to bring the correct terminal to the front; in tab mode, uses PowerShell `UIAutomation` to select the right Windows Terminal tab
+1. **Process discovery**: polls `tasklist` every 10 seconds to find `claude.exe` PIDs, then separates root processes from subagents by checking parent PIDs
+2. **Session matching**: scans `~/.claude/projects/` for recently modified `.jsonl` files and correlates them to PIDs using I/O write-operation deltas (`GetProcessIoCounters`)
+3. **Status detection**: reads the tail of each session's JSONL to determine the current state (last message type, stop reason, tool-use content blocks)
+4. **Auto-approve**: when a session shows `APPROVE?` status, injects an `Enter` keypress into the process's console input buffer via `WriteConsoleInputW` (falls back to `PostMessage WM_KEYDOWN`)
+5. **Focus**: uses `AttachConsole` + `GetConsoleWindow` + `SetForegroundWindow` to bring the correct terminal to the front; in tab mode, uses PowerShell `UIAutomation` to select the right Windows Terminal tab
 
 ### Configuration
 
 Settings are stored in `~/.claude/session_tracker_config.json`:
 
-- `mode` — `"window"` (default) or `"tab"`
-- `session_cwd` — working directory for new sessions (default: `~`)
+- `mode`: `"window"` (default) or `"tab"`
+- `session_cwd`: working directory for new sessions (default: `~`)
 
 ## License
 
