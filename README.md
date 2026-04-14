@@ -8,7 +8,7 @@ An always-on-top desktop widget for Windows that monitors and manages multiple [
 
 ## Features
 
-- **Live session tracking**: automatically discovers active Claude Code sessions by monitoring `~/.claude/projects/` JSONL files and correlating them with running `claude.exe` processes via I/O write counters
+- **Live session tracking**: automatically discovers active Claude Code sessions by monitoring `~/.claude/projects/` JSONL files regardless of location and correlating them with running `claude.exe` processes via I/O write counters
 - **Real-time status indicators**: shows each session's state: `READY`, `THINKING`, `APPROVE?`, `REJECTED`, or `INTERRUPTED`
 - **Auto-approve**: automatically sends `Enter` to approve pending tool-use permission prompts (global toggle + per-session override)
 - **Click to focus**: click any session row to bring its terminal window to the foreground (uses `AttachConsole`/`SetForegroundWindow`, with `UIAutomation` tab-switching fallback in tab mode)
