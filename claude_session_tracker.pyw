@@ -80,8 +80,20 @@ pid=int(sys.argv[1])
 if k.AttachConsole(pid):
  hw=k.GetConsoleWindow()
  if hw:
-  u.ShowWindow(int(hw),9)
-  u.SetForegroundWindow(int(hw))
+  hw=int(hw)
+  # Alt-key trick + AttachThreadInput to bypass Windows foreground lock.
+  # Without this, SetForegroundWindow silently fails when no session
+  # window is currently active (e.g. all minimized or behind other apps).
+  u.keybd_event(0x12,0,0,0)  # Alt down
+  u.keybd_event(0x12,0,2,0)  # Alt up
+  cur=k.GetCurrentThreadId()
+  tgt=u.GetWindowThreadProcessId(hw,None)
+  u.AttachThreadInput(cur,tgt,True)
+  u.ShowWindow(hw,9)       # SW_RESTORE (unminimizes if needed)
+  u.BringWindowToTop(hw)
+  u.SetForegroundWindow(hw)
+  u.SwitchToThisWindow(hw,True)
+  u.AttachThreadInput(cur,tgt,False)
  k.FreeConsole()
 '''
 
@@ -1427,8 +1439,18 @@ class SessionTracker:
                     hwnd = find_window_for_pid(p)
                     if hwnd:
                         _user32 = ctypes.windll.user32
+                        _kern = ctypes.windll.kernel32
+                        # Alt-key + AttachThreadInput bypass foreground lock
+                        _user32.keybd_event(0x12, 0, 0, 0)
+                        _user32.keybd_event(0x12, 0, 2, 0)
+                        cur = _kern.GetCurrentThreadId()
+                        tgt = _user32.GetWindowThreadProcessId(hwnd, None)
+                        _user32.AttachThreadInput(cur, tgt, True)
                         _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                        _user32.BringWindowToTop(hwnd)
                         _user32.SetForegroundWindow(hwnd)
+                        _user32.SwitchToThisWindow(hwnd, True)
+                        _user32.AttachThreadInput(cur, tgt, False)
                         return
                     # Last resort: AppActivate with console title (not display name)
                     title = self._console_titles.get(p, "")
@@ -1797,7 +1819,31 @@ def _ask_mode():
     return choice[0] or "window"
 
 
+def _acquire_singleton_mutex():
+    """Create a named mutex so only one tracker runs at a time.
+    Returns the handle (keep alive for process lifetime) or None if
+    another instance already holds it after a short retry window —
+    the retry covers the brief overlap when _restart spawns a new
+    instance before the old one has exited."""
+    ERROR_ALREADY_EXISTS = 183
+    _kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    for attempt in range(10):
+        handle = _kernel32.CreateMutexW(None, False,
+                                         "ClaudeSessionTracker_Singleton_v1")
+        if not handle:
+            return None
+        if _kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+            return handle
+        _kernel32.CloseHandle(handle)
+        time.sleep(0.3)
+    return None
+
+
 if __name__ == "__main__":
+    _singleton_handle = _acquire_singleton_mutex()
+    if _singleton_handle is None:
+        sys.exit(0)
     try:
         _ensure_startup_shortcut()
         cfg = _load_config()
