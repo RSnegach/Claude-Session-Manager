@@ -1003,15 +1003,15 @@ class SessionTracker:
             self._console_titles = get_console_titles(root)
             self._console_titles_time = time.time()
 
-    def _approve_session(self, session):
+    def _approve_session(self, session, all_sessions=None):
         """Send approval keys to the terminal showing the approval prompt."""
         threading.Thread(
             target=self._send_approve_keys,
-            args=(session,),
+            args=(session, all_sessions),
             daemon=True,
         ).start()
 
-    def _send_approve_keys(self, session):
+    def _send_approve_keys(self, session, all_sessions=None):
         """Send Enter to approve via direct console input (subprocess-isolated).
         Passes the terminal HWND as fallback for PostMessage.
         Only sends to the mapped PID — never broadcasts to all processes."""
@@ -1020,6 +1020,20 @@ class SessionTracker:
             # Force-refresh PIDs + console titles, then retry mapping
             self._update_pid_mapping_force(session)
             pid = self._find_pid_for_session(session)
+        if not pid:
+            # Last-resort: if this is the ONLY session currently waiting for
+            # approval and there's exactly ONE unmapped root PID, use it.
+            # This rescues sessions whose console title doesn't match their
+            # name (resumed sessions, custom titles, etc.).
+            if all_sessions:
+                approvals = [s for s in all_sessions if s["status"] == "approval"]
+                if len(approvals) == 1:
+                    root = self._get_root_pids()
+                    mapped = set(self._session_to_pid.values())
+                    unmapped = [p for p in root if p not in mapped]
+                    if len(unmapped) == 1:
+                        pid = unmapped[0]
+                        self._session_to_pid[session["session_id"]] = pid
         if not pid:
             return
         hwnd = find_window_for_pid(pid) or 0
@@ -1573,7 +1587,7 @@ class SessionTracker:
             if s["status"] == "approval":
                 last = self._approve_last_attempt.get(sid, 0)
                 if now - last >= 2:
-                    self._approve_session(s)
+                    self._approve_session(s, sessions)
                     self._approve_last_attempt[sid] = now
             else:
                 self._approve_last_attempt.pop(sid, None)
