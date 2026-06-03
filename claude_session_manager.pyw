@@ -1,14 +1,26 @@
 """
-Claude Code Session Manager v1.6.2
+Claude Code Session Manager v1.6.3
 Small always-on-top widget that monitors active Claude Code sessions.
 Shows the N most recently active sessions (where N = claude.exe process count).
 Click session name to focus its terminal. Pencil icon to rename.
 
+CHANGELOG v1.6.3:
+- Fixed false READY: a session is READY only when its last turn actually ended
+  (assistant stop_reason == "end_turn"). File growth is no longer used to infer
+  done-ness, because the JSONL goes quiet during extended thinking and long
+  tool calls — that quiet was being misread as "done". THINKING now persists
+  through those gaps until the turn truly ends.
+- APPROVE? flags are now click-to-focus too (like DECISION), so a pending
+  permission prompt on a session with auto-approve OFF takes you straight there.
+- Auto-approve Enter fallback: if a session with auto-approve ON still shows
+  APPROVE? for more than 3s (a prompt bypassPermissions didn't suppress), the
+  manager sends a single Enter to clear it (re-tried at most once every 4s).
+  Gated strictly to APPROVE? — a DECISION (question/plan menu) is resolved
+  earlier in the status logic and can never reach this path, so Enter can
+  never auto-pick a menu choice.
+
 CHANGELOG v1.6.2:
-- THINKING is now ironclad: a session shows THINKING only while its JSONL is
-  actively growing. Once it goes idle without a blocking prompt, it resolves
-  to READY even if the last entry wasn't a clean end_turn (fixes sessions
-  stuck on THINKING at rest).
+- THINKING gated on file growth (superseded by v1.6.3).
 - Clicking a purple DECISION flag now focuses that session's window so you
   can answer the prompt (focus only happens on click, never automatically).
 
@@ -41,7 +53,7 @@ CHANGELOG v1.5.0:
 - Subagents now inherit parent session's PID for key sending
 """
 
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 import sys
 import os
@@ -129,14 +141,17 @@ if k.AttachConsole(pid):
 # distinct "decision" status instead of "approval".
 DECISION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
-# A session is only "thinking" while its JSONL is actively growing. If it has
-# been quiet at least this long and is not in a blocking state (decision /
-# approval / interrupted / rejected), it is at rest -> "ready". This keeps
-# THINKING honest: it never lingers on a session that has gone idle with an
-# unclean / non-end_turn last entry. Refresh runs every 500ms and streaming
-# writes are sub-second, so a genuinely working session always re-grows well
-# within this window.
-THINKING_IDLE_SECONDS = 3
+# Status flags that mean "this session is waiting on you" — clicking the flag
+# focuses that session's window so you can answer the prompt in the terminal.
+CLICKABLE_FLAGS = {"approval", "decision"}
+
+# Auto-approve Enter fallback timing. If a session with auto-approve ON still
+# shows APPROVE? this long, the permission-mode setting evidently didn't catch
+# it (race on a just-launched session, an ask-rule, etc.) so we press Enter.
+# NOTE: only fires for "approval" — never "decision" — so it can never auto-
+# answer a question/plan menu. Re-pressed at most once per cooldown.
+APPROVE_FALLBACK_DELAY = 3      # seconds APPROVE? must persist before Enter
+APPROVE_FALLBACK_COOLDOWN = 4   # min seconds between Enter presses per session
 
 # Titles that indicate "no custom name set"
 _DEFAULT_TITLES = {"claude code", ""}
@@ -355,6 +370,54 @@ def send_text_to_process(pid, text):
     """Send arbitrary text + Enter to a process's console input buffer."""
     subprocess.Popen(
         [PYTHON_EXE, "-c", _SEND_TEXT_SCRIPT, str(pid), text],
+        creationflags=CREATE_NO_WINDOW,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# Sends a single Enter (VK_RETURN key-down) to a process's console — used only
+# as the auto-approve fallback for permission prompts that bypassPermissions
+# did not suppress. Writes one key-down record via WriteConsoleInputW; falls
+# back to PostMessage WM_KEYDOWN against the supplied HWND.
+_SEND_ENTER_SCRIPT = r'''import ctypes,sys,time
+k=ctypes.windll.kernel32
+u=ctypes.windll.user32
+k.FreeConsole()
+k.CreateFileW.restype=ctypes.c_void_p
+IV=ctypes.c_void_p(-1).value
+pid=int(sys.argv[1])
+hwnd=int(sys.argv[2]) if len(sys.argv)>2 else 0
+if k.AttachConsole(pid):
+ time.sleep(0.05)
+ h=k.CreateFileW("CONIN$",0xC0000000,3,None,3,0,None)
+ if h and h!=IV:
+  class K(ctypes.Structure):
+   _fields_=[("d",ctypes.c_int),("r",ctypes.c_ushort),("vk",ctypes.c_ushort),("vs",ctypes.c_ushort),("c",ctypes.c_wchar),("s",ctypes.c_ulong)]
+  class I(ctypes.Structure):
+   class E(ctypes.Union):
+    _fields_=[("k",K)]
+   _fields_=[("t",ctypes.c_ushort),("e",E)]
+  w=ctypes.c_ulong()
+  rec=I();rec.t=1;rec.e.k.d=1;rec.e.k.vk=0x0D;rec.e.k.vs=0x1C;rec.e.k.c="\r";rec.e.k.s=0
+  result=k.WriteConsoleInputW(h,ctypes.byref(rec),1,ctypes.byref(w))
+  k.CloseHandle(h)
+  k.FreeConsole()
+  if result and w.value==1:
+   sys.exit(0)
+ k.FreeConsole()
+if hwnd:
+ u.PostMessageW(hwnd,0x0100,0x0D,0x001C0001)
+'''
+
+
+def send_enter_to_process(pid, hwnd=0):
+    """Send a single Enter to a process's console (auto-approve fallback)."""
+    args = [PYTHON_EXE, "-c", _SEND_ENTER_SCRIPT, str(pid)]
+    if hwnd:
+        args.append(str(hwnd))
+    subprocess.Popen(
+        args,
         creationflags=CREATE_NO_WINDOW,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -701,6 +764,14 @@ class SessionManager:
         # Restore any files left in bypass by a previous (crashed) run before
         # we start managing fresh — clean slate, reconciliation re-applies.
         self._restore_all_managed()
+
+        # Auto-approve Enter fallback: when a session has auto-approve ON but
+        # still shows APPROVE? (a permission prompt bypassPermissions didn't
+        # suppress), send Enter after it has persisted a few seconds.
+        #   _approval_seen_at[sid] -> first time we saw this APPROVE? streak
+        #   _approval_last_enter[sid] -> last time we sent Enter (cooldown)
+        self._approval_seen_at = {}
+        self._approval_last_enter = {}
 
         self._after_id = None  # track refresh timer to prevent duplicates
 
@@ -1173,6 +1244,21 @@ class SessionManager:
             self._console_titles = get_console_titles(root)
             self._console_titles_time = time.time()
 
+    def _send_enter_fallback(self, session):
+        """Send a single Enter to the session's terminal to clear a lingering
+        permission prompt. Only the mapped PID is targeted — never broadcast.
+        Runs in a thread so the subprocess never blocks the UI refresh."""
+        def _do():
+            pid = self._find_pid_for_session(session)
+            if not pid:
+                self._update_pid_mapping_force(session)
+                pid = self._find_pid_for_session(session)
+            if not pid:
+                return
+            hwnd = find_window_for_pid(pid) or 0
+            send_enter_to_process(pid, hwnd)
+        threading.Thread(target=_do, daemon=True).start()
+
     def _read_tail_status(self, jsonl_path):
         """Read the tail of a JSONL file.
         Returns (last_type, last_stop_reason, interrupted)."""
@@ -1279,22 +1365,24 @@ class SessionManager:
             return "decision"
 
         # tool_use detected in content (either via stop_reason or content
-        # blocks) — a permission prompt is pending. Also a blocking state, so
-        # it is not subject to the idle->ready rule below.
+        # blocks) — a permission prompt is pending. Blocking state.
         if tool_use_is_last:
             return "approval"
 
-        # Clean end of turn — at rest.
+        # READY only when the last turn actually ended: an assistant entry with
+        # stop_reason == "end_turn". This is the ONLY reliable "done" signal.
+        #
+        # We deliberately do NOT use file growth to infer done-ness: the JSONL
+        # goes quiet for many seconds during extended thinking AND during long
+        # tool calls (the tool_use entry is written when the tool is requested,
+        # the result only when it finishes — a multi-minute command writes
+        # nothing in between). Treating a quiet gap as "ready" produced a false
+        # READY mid-work. So anything that is not a finished turn and not a
+        # blocking prompt is still THINKING, and stays THINKING through quiet
+        # gaps until end_turn arrives.
         if last_type == "assistant" and stop_reason == "end_turn":
             return "ready"
-
-        # Not blocked and not a clean end_turn. The ONLY thing that tells
-        # "thinking" apart from "at rest with an unclean last entry" is whether
-        # the JSONL is still actively growing. If it has gone quiet, the
-        # session is at rest -> ready; otherwise it is genuinely working.
-        if since_growth <= THINKING_IDLE_SECONDS:
-            return "thinking"
-        return "ready"
+        return "thinking"
 
     def _scan_sessions(self):
         """Find active sessions and update PID mapping via I/O correlation."""
@@ -1757,6 +1845,38 @@ class SessionManager:
                 self._auto_approve_sessions[sid] = self._auto_approve_global
         self._reconcile_permission_modes()
 
+        # Auto-approve Enter fallback: bypassPermissions normally suppresses
+        # permission prompts, but a few slip through (a just-launched session
+        # before the setting is read, an explicit ask-rule, etc.). For sessions
+        # with auto-approve ON, if APPROVE? persists past APPROVE_FALLBACK_DELAY
+        # send a single Enter. This is gated to "approval" ONLY — a "decision"
+        # (question/plan menu) never reaches here, so Enter can't auto-pick a
+        # menu choice.
+        now = time.time()
+        live_ids = set()
+        for s in sessions:
+            sid = s["session_id"]
+            live_ids.add(sid)
+            want = self._auto_approve_sessions.get(sid, self._auto_approve_global)
+            if s["status"] == "approval" and want:
+                first = self._approval_seen_at.get(sid)
+                if first is None:
+                    self._approval_seen_at[sid] = now
+                elif now - first >= APPROVE_FALLBACK_DELAY:
+                    last = self._approval_last_enter.get(sid, 0)
+                    if now - last >= APPROVE_FALLBACK_COOLDOWN:
+                        self._send_enter_fallback(s)
+                        self._approval_last_enter[sid] = now
+            else:
+                # No longer pending (or auto-approve off) — reset the streak.
+                self._approval_seen_at.pop(sid, None)
+                self._approval_last_enter.pop(sid, None)
+        # Drop state for sessions that disappeared.
+        for sid in list(self._approval_seen_at):
+            if sid not in live_ids:
+                self._approval_seen_at.pop(sid, None)
+                self._approval_last_enter.pop(sid, None)
+
         status_colors = {
             "ready": "#00dd77",
             "thinking": "#4499ff",
@@ -1797,9 +1917,10 @@ class SessionManager:
                 widgets["dot"].delete("all")
                 widgets["dot"].create_oval(0, 0, 8, 8, fill=color, outline=color)
                 widgets["name"].configure(text=dn)
-                # Clicking a DECISION flag focuses that session's window so you
-                # can answer the prompt. Rebind every cycle since status changes.
-                if status == "decision":
+                # Clicking an APPROVE?/DECISION flag focuses that session's
+                # window so you can answer it. Rebind every cycle since the
+                # status (and thus whether the tag is clickable) can change.
+                if status in CLICKABLE_FLAGS:
                     widgets["tag"].configure(text=tag, fg=color, cursor="hand2")
                     widgets["tag"].bind("<Button-1>",
                         lambda e, sess=s: self._focus_session(sess))
@@ -1863,11 +1984,11 @@ class SessionManager:
                     tag_label = tk.Label(
                         row, text=tag, font=("Consolas", 7, "bold"),
                         fg=color, bg="#12121e",
-                        cursor="hand2" if status == "decision" else "",
+                        cursor="hand2" if status in CLICKABLE_FLAGS else "",
                     )
                     tag_label.pack(side="right")
-                    # Clicking a DECISION flag focuses that session's window.
-                    if status == "decision":
+                    # Clicking an APPROVE?/DECISION flag focuses its window.
+                    if status in CLICKABLE_FLAGS:
                         tag_label.bind("<Button-1>",
                             lambda e, sess=s: self._focus_session(sess))
 

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.6.3
+
+- Fixed false `READY`: a session is `READY` only when its last turn actually ended (assistant `stop_reason == "end_turn"`). File growth is no longer used to infer done-ness, because the JSONL goes quiet during extended thinking and long tool calls — that quiet was being misread as "done", causing `THINKING` to flicker to `READY` mid-work. `THINKING` now persists through those gaps until the turn truly ends.
+- `APPROVE?` flags are now click-to-focus (like `DECISION`): clicking jumps to that session's window.
+- Added an auto-approve `Enter` fallback. If a session with auto-approve ON still shows `APPROVE?` for more than ~3 seconds (a permission prompt `bypassPermissions` did not suppress — e.g. a race on a just-launched session or an explicit ask-rule), the manager sends a single `Enter` to that session's console, re-tried at most once every 4 seconds. Strictly gated to `APPROVE?`: a `DECISION` (question / plan menu) is resolved earlier in the status logic and can never reach this path, so `Enter` can never auto-select a menu choice.
+
 ## v1.6.2
 
 - `THINKING` is now ironclad: a session shows `THINKING` only while its JSONL is actively growing. Once it goes idle without a blocking prompt (`APPROVE?` / `DECISION` / interrupted / rejected), it resolves to `READY` even when the last entry was not a clean `end_turn`. Fixes sessions that could stick on `THINKING` at rest.
