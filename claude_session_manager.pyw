@@ -1,8 +1,21 @@
 """
-Claude Code Session Tracker v1.5.0
+Claude Code Session Manager v1.6.0
 Small always-on-top widget that monitors active Claude Code sessions.
 Shows the N most recently active sessions (where N = claude.exe process count).
 Click session name to focus its terminal. Pencil icon to rename.
+
+CHANGELOG v1.6.0:
+- Replaced keystroke-based auto-approve with permission-mode control.
+  The green "A" now sets the session's project permissions.defaultMode to
+  "bypassPermissions" (auto-approve everything, no prompts) when ON, and
+  "default" (normal prompting) when OFF. Claude reloads this live.
+- No more missed/duplicated Enter presses or accidental top-choice selection
+  on dropdown prompts — Claude simply never prompts when bypass is on.
+- Settings writes are merge-only (allow-lists preserved) and atomic.
+- Original defaultMode is captured and restored on toggle-off, session close,
+  app exit, and after a crash (managed state persisted to disk).
+- NOTE: permission mode is scoped to the working directory, not the session,
+  so sessions launched from the SAME folder share one "A" state.
 
 CHANGELOG v1.5.0:
 - Added full subagent support (displays subagents with 🤖 prefix)
@@ -14,14 +27,14 @@ CHANGELOG v1.5.0:
 - Subagents now inherit parent session's PID for key sending
 """
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 import sys
 import os
 import platform
 
 if platform.system() != "Windows":
-    print("Claude Code Session Tracker requires Windows.", file=sys.stderr)
+    print("Claude Code Session Manager requires Windows.", file=sys.stderr)
     sys.exit(1)
 
 import ctypes
@@ -281,41 +294,6 @@ class _INPUT_RECORD(ctypes.Structure):
     ]
 
 
-_SEND_APPROVE_SCRIPT = r'''import ctypes,sys,time
-k=ctypes.windll.kernel32
-u=ctypes.windll.user32
-k.FreeConsole()
-k.CreateFileW.restype=ctypes.c_void_p
-IV=ctypes.c_void_p(-1).value
-pid=int(sys.argv[1])
-hwnd=int(sys.argv[2]) if len(sys.argv)>2 else 0
-# Try writing directly to console input
-if k.AttachConsole(pid):
- time.sleep(0.05)
- h=k.CreateFileW("CONIN$",0xC0000000,3,None,3,0,None)
- if h and h!=IV:
-  class K(ctypes.Structure):
-   _fields_=[("d",ctypes.c_int),("r",ctypes.c_ushort),("vk",ctypes.c_ushort),("vs",ctypes.c_ushort),("c",ctypes.c_wchar),("s",ctypes.c_ulong)]
-  class I(ctypes.Structure):
-   class E(ctypes.Union):
-    _fields_=[("k",K)]
-   _fields_=[("t",ctypes.c_ushort),("e",E)]
-  w=ctypes.c_ulong()
-  # Send ONLY key down event with VK_RETURN
-  rec=I();rec.t=1;rec.e.k.d=1;rec.e.k.vk=0x0D;rec.e.k.vs=0x1C;rec.e.k.c="\r";rec.e.k.s=0
-  result=k.WriteConsoleInputW(h,ctypes.byref(rec),1,ctypes.byref(w))
-  k.CloseHandle(h)
-  k.FreeConsole()
-  if result and w.value==1:
-   sys.exit(0)
- k.FreeConsole()
-# Fallback: use PostMessage
-if hwnd:
- u.PostMessageW(hwnd,0x0100,0x0D,0x001C0001)
-'''
-
-
-
 _SEND_TEXT_SCRIPT = r'''import ctypes,sys,time
 k=ctypes.windll.kernel32
 k.FreeConsole()
@@ -349,21 +327,6 @@ def send_text_to_process(pid, text):
     """Send arbitrary text + Enter to a process's console input buffer."""
     subprocess.Popen(
         [PYTHON_EXE, "-c", _SEND_TEXT_SCRIPT, str(pid), text],
-        creationflags=CREATE_NO_WINDOW,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def send_approve_to_process(pid, hwnd=0):
-    """Send Enter to a process's console to approve the permission prompt.
-    Uses python.exe (console app) for reliable AttachConsole.
-    Falls back to PostMessage WM_CHAR if WriteConsoleInputW fails."""
-    args = [PYTHON_EXE, "-c", _SEND_APPROVE_SCRIPT, str(pid)]
-    if hwnd:
-        args.append(str(hwnd))
-    subprocess.Popen(
-        args,
         creationflags=CREATE_NO_WINDOW,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -536,14 +499,118 @@ def rename_session(session_id, project_path, new_name):
         return False
 
 
-class SessionTracker:
+# --- Permission-mode control (replaces keystroke auto-approve) -------------
+# Claude Code reads permissions.defaultMode from the project's
+# .claude/settings.local.json and reloads it live mid-session. We drive that
+# key per project to turn auto-approve on/off.
+#   ON  -> "bypassPermissions" (runs every tool call without prompting)
+#   OFF -> "default"           (normal prompting, per the requested behavior)
+# Note: this is scoped to the working directory, not the individual session —
+# sessions launched from the SAME folder share one settings file and move
+# together. Per-PID permission control is not exposed by Claude Code.
+AUTO_APPROVE_MODE = "bypassPermissions"
+OFF_MODE = "default"
+
+# Files we have flipped are recorded here (path -> original defaultMode, which
+# may be null) so we can restore the user's baseline on exit or after a crash.
+MANAGED_STATE_FILE = CLAUDE_DIR / "session_manager_managed.json"
+
+
+def get_session_cwd(jsonl_path):
+    """Read the session's working directory from its JSONL 'cwd' field."""
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    cwd = json.loads(line).get("cwd")
+                    if cwd:
+                        return os.path.normpath(cwd)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def settings_file_for_cwd(cwd):
+    """The project-local settings file Claude reads for a session in cwd."""
+    return os.path.normpath(os.path.join(cwd, ".claude", "settings.local.json"))
+
+
+def _read_json_file(path):
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _atomic_write_json(path, data):
+    """Write JSON via temp + os.replace so a concurrently-reading Claude
+    process never observes a half-written file."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def get_default_mode(path):
+    """Return permissions.defaultMode from a settings file, or None."""
+    perms = _read_json_file(path).get("permissions", {})
+    return perms.get("defaultMode") if isinstance(perms, dict) else None
+
+
+def set_default_mode(path, mode):
+    """Merge-set permissions.defaultMode, preserving every other key (e.g. the
+    allow-list). mode=None removes the key entirely."""
+    data = _read_json_file(path)
+    perms = data.get("permissions")
+    if not isinstance(perms, dict):
+        perms = {}
+        data["permissions"] = perms
+    if mode is None:
+        perms.pop("defaultMode", None)
+    else:
+        perms["defaultMode"] = mode
+    return _atomic_write_json(path, data)
+
+
+def _load_managed_settings():
+    """{settings_path: original_defaultMode_or_null} for files we've flipped."""
+    try:
+        if MANAGED_STATE_FILE.exists():
+            d = json.loads(MANAGED_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _save_managed_settings(managed):
+    try:
+        MANAGED_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MANAGED_STATE_FILE.write_text(
+            json.dumps(managed, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+class SessionManager:
     def __init__(self, mode="window"):
         self._mode = mode  # "window" or "tab"
         cfg = _load_config()
         self._session_cwd = os.path.normpath(
             cfg.get("session_cwd", os.path.expanduser("~")))
         self.root = tk.Tk()
-        self.root.title(f"Session Tracker v{VERSION}")
+        self.root.title(f"Session Manager v{VERSION}")
         self.root.attributes("-topmost", True)
         self.root.overrideredirect(True)
         self.root.configure(bg="#12121e")
@@ -593,10 +660,19 @@ class SessionTracker:
         self._new_session_pid_names = {}  # pid -> "New Session #"
         self._placeholder_names = {}     # session_id -> "New Session #"
 
-        # Auto-approve: per-session toggle, global default ON
+        # Auto-approve: per-session intent toggle, global default ON.
+        # ON  => session's project settings.local.json defaultMode = bypassPermissions
+        # OFF => restore that file's original defaultMode (the user's baseline)
         self._auto_approve_global = True
-        self._auto_approve_sessions = {}  # session_id -> bool (per-session override)
-        self._approve_last_attempt = {}  # session_id -> timestamp of last approve attempt
+        self._auto_approve_sessions = {}  # session_id -> bool (per-session intent)
+        self._session_cwd_map = {}        # session_id -> resolved working dir
+        # Settings files we have flipped to bypass: path(str) -> original
+        # defaultMode (a mode string, or None if the key was absent).
+        # Persisted to config so a crash can't strand a file in bypass.
+        self._managed_settings = _load_managed_settings()
+        # Restore any files left in bypass by a previous (crashed) run before
+        # we start managing fresh — clean slate, reconciliation re-applies.
+        self._restore_all_managed()
 
         self._after_id = None  # track refresh timer to prevent duplicates
 
@@ -820,7 +896,7 @@ class SessionTracker:
         if not os.path.isfile(script):
             parent = os.path.dirname(script)
             candidates = sorted(
-                Path(parent).glob("claude_session_tracker*.pyw"),
+                Path(parent).glob("claude_session_manager*.pyw"),
                 key=lambda p: p.stat().st_mtime, reverse=True,
             )
             if candidates:
@@ -856,9 +932,8 @@ class SessionTracker:
         self._restart()
 
     def _toggle_auto_approve(self, event=None):
-        """Global toggle: turn ALL sessions on or off."""
+        """Global toggle: turn ALL sessions on or off at once."""
         self._auto_approve_global = not self._auto_approve_global
-        self._approve_last_attempt.clear()
         # Set all tracked sessions to match the global state
         for sid in list(self._auto_approve_sessions):
             self._auto_approve_sessions[sid] = self._auto_approve_global
@@ -868,12 +943,79 @@ class SessionTracker:
         else:
             self._auto_toggle.configure(text="OFF", fg="#555566", bg="#222233")
             self._auto_label.configure(fg="#555566")
+        self._reconcile_permission_modes()
 
     def _toggle_session_approve(self, session_id):
-        """Per-session toggle."""
+        """Per-session toggle of auto-approve intent."""
         current = self._auto_approve_sessions.get(session_id, self._auto_approve_global)
         self._auto_approve_sessions[session_id] = not current
-        self._approve_last_attempt.pop(session_id, None)
+        self._reconcile_permission_modes()
+
+    def _reconcile_permission_modes(self):
+        """Apply each session's auto-approve intent to the permissions.defaultMode
+        of its project settings file.
+
+        Because the mode is scoped to the working directory (not the session),
+        sessions sharing a folder are grouped: a folder goes to bypass if ANY
+        of its sessions wants auto-approve. When no remaining session in a
+        managed folder wants it, the file's original defaultMode is restored.
+
+        Only writes on an actual change, so the 500ms refresh that calls this
+        does not thrash settings files."""
+        # Group currently-known sessions by their settings file, OR-ing intent.
+        want_bypass = {}  # settings_path -> True if any session wants auto-approve
+        for sid, cwd in self._session_cwd_map.items():
+            if not cwd:
+                continue
+            path = settings_file_for_cwd(cwd)
+            intent = self._auto_approve_sessions.get(sid, self._auto_approve_global)
+            want_bypass[path] = want_bypass.get(path, False) or bool(intent)
+
+        changed = False
+
+        # Apply bypass where wanted; restore where no longer wanted.
+        for path, wants in want_bypass.items():
+            if wants:
+                if path not in self._managed_settings:
+                    # First time managing this file — remember its baseline so
+                    # we can restore it later, then flip to bypass.
+                    self._managed_settings[path] = get_default_mode(path)
+                    set_default_mode(path, AUTO_APPROVE_MODE)
+                    changed = True
+                elif get_default_mode(path) != AUTO_APPROVE_MODE:
+                    # Re-assert (e.g. user edited the file) without touching
+                    # the stored baseline.
+                    set_default_mode(path, AUTO_APPROVE_MODE)
+            else:
+                # A managed folder whose sessions no longer want auto-approve:
+                # the requested OFF behavior is defaultMode = "default".
+                if get_default_mode(path) != OFF_MODE:
+                    set_default_mode(path, OFF_MODE)
+                    changed = True
+
+        # Folders we manage but that have NO live sessions anymore -> fully
+        # restore their original baseline and stop tracking them.
+        for path in list(self._managed_settings):
+            if path not in want_bypass:
+                self._restore_managed(path)
+                changed = True
+
+        if changed:
+            _save_managed_settings(self._managed_settings)
+
+    def _restore_managed(self, path):
+        """Restore one settings file to its remembered baseline and forget it."""
+        if path not in self._managed_settings:
+            return
+        original = self._managed_settings.pop(path)
+        set_default_mode(path, original)
+
+    def _restore_all_managed(self):
+        """Restore every file we have flipped back to its baseline. Called on
+        startup (clean up after a crash) and on exit."""
+        for path in list(self._managed_settings):
+            self._restore_managed(path)
+        _save_managed_settings(self._managed_settings)
 
     def _toggle_minimize(self, event=None):
         self._minimized = not self._minimized
@@ -1002,43 +1144,6 @@ class SessionTracker:
         if root:
             self._console_titles = get_console_titles(root)
             self._console_titles_time = time.time()
-
-    def _approve_session(self, session, all_sessions=None):
-        """Send approval keys to the terminal showing the approval prompt."""
-        threading.Thread(
-            target=self._send_approve_keys,
-            args=(session, all_sessions),
-            daemon=True,
-        ).start()
-
-    def _send_approve_keys(self, session, all_sessions=None):
-        """Send Enter to approve via direct console input (subprocess-isolated).
-        Passes the terminal HWND as fallback for PostMessage.
-        Only sends to the mapped PID — never broadcasts to all processes."""
-        pid = self._find_pid_for_session(session)
-        if not pid:
-            # Force-refresh PIDs + console titles, then retry mapping
-            self._update_pid_mapping_force(session)
-            pid = self._find_pid_for_session(session)
-        if not pid:
-            # Last-resort: if this is the ONLY session currently waiting for
-            # approval and there's exactly ONE unmapped root PID, use it.
-            # This rescues sessions whose console title doesn't match their
-            # name (resumed sessions, custom titles, etc.).
-            if all_sessions:
-                approvals = [s for s in all_sessions if s["status"] == "approval"]
-                if len(approvals) == 1:
-                    root = self._get_root_pids()
-                    mapped = set(self._session_to_pid.values())
-                    unmapped = [p for p in root if p not in mapped]
-                    if len(unmapped) == 1:
-                        pid = unmapped[0]
-                        self._session_to_pid[session["session_id"]] = pid
-        if not pid:
-            return
-        hwnd = find_window_for_pid(pid) or 0
-        send_approve_to_process(pid, hwnd)
-
 
     def _read_tail_status(self, jsonl_path):
         """Read the tail of a JSONL file.
@@ -1256,6 +1361,14 @@ class SessionTracker:
                 del self._file_tracker[sid]
                 self._name_cache.pop(sid, None)
                 self._session_to_pid.pop(sid, None)
+        # Drop cwd/intent state for sessions that have gone away so a closed
+        # session stops pinning its folder to bypass mode.
+        for sid in list(self._session_cwd_map.keys()):
+            if sid not in active_ids:
+                del self._session_cwd_map[sid]
+        for sid in list(self._auto_approve_sessions.keys()):
+            if sid not in active_ids:
+                del self._auto_approve_sessions[sid]
 
         # Match pending "+" PIDs to newly appeared sessions (closest timestamp)
         # Only used as fallback when direct PID+JSONL detection didn't work
@@ -1360,6 +1473,18 @@ class SessionTracker:
                     self._placeholder_names.pop(session_id, None)
 
             status = self._get_session_status(session_id, jsonl)
+
+            # Resolve and cache the session's working directory (for permission
+            # mode control). cwd never changes, so read the JSONL only once.
+            # Subagents inherit the parent session's cwd.
+            if session_id not in self._session_cwd_map:
+                if "/subagents/" in session_id:
+                    parent_sid = session_id.split("/subagents/")[0]
+                    cwd = self._session_cwd_map.get(parent_sid)
+                else:
+                    cwd = get_session_cwd(jsonl)
+                if cwd:
+                    self._session_cwd_map[session_id] = cwd
 
             sessions.append({
                 "name": name,
@@ -1573,32 +1698,15 @@ class SessionTracker:
 
         sessions = self._scan_sessions()
 
-        # Auto-approve: per-session, cooldown-based (no retry limit)
-        now = time.time()
-        current_ids = set()
+        # Auto-approve via permission mode: ensure every live session has an
+        # intent (defaulting to the global state), then reconcile the per-folder
+        # defaultMode settings. Reconcile only writes on an actual change, so
+        # this is cheap to call every refresh.
         for s in sessions:
             sid = s["session_id"]
-            current_ids.add(sid)
-            # Initialize new sessions to global default
             if sid not in self._auto_approve_sessions:
                 self._auto_approve_sessions[sid] = self._auto_approve_global
-            if not self._auto_approve_sessions.get(sid):
-                continue
-            if s["status"] == "approval":
-                last = self._approve_last_attempt.get(sid, 0)
-                if now - last >= 2:
-                    self._approve_session(s, sessions)
-                    self._approve_last_attempt[sid] = now
-            else:
-                self._approve_last_attempt.pop(sid, None)
-
-        # Clean up state for disappeared sessions
-        for sid in list(self._approve_last_attempt):
-            if sid not in current_ids:
-                del self._approve_last_attempt[sid]
-        for sid in list(self._auto_approve_sessions):
-            if sid not in current_ids:
-                del self._auto_approve_sessions[sid]
+        self._reconcile_permission_modes()
 
         status_colors = {
             "ready": "#00dd77",
@@ -1638,10 +1746,7 @@ class SessionTracker:
                 widgets["dot"].delete("all")
                 widgets["dot"].create_oval(0, 0, 8, 8, fill=color, outline=color)
                 widgets["name"].configure(text=dn)
-                widgets["tag"].configure(
-                    text=tag, fg=color,
-                    cursor="hand2" if status == "approval" else "",
-                )
+                widgets["tag"].configure(text=tag, fg=color)
                 # Update per-session auto-approve button
                 aa = self._auto_approve_sessions.get(sid, self._auto_approve_global)
                 widgets["aa"].configure(
@@ -1655,11 +1760,6 @@ class SessionTracker:
                     lambda e, sess=s: self._focus_session(sess))
                 widgets["pencil"].bind("<Button-1>",
                     lambda e, l=widgets["name"], sess=s: self._start_rename(e, l, sess))
-                if status == "approval":
-                    widgets["tag"].bind("<Button-1>",
-                        lambda e, sess=s: self._approve_session(sess))
-                else:
-                    widgets["tag"].unbind("<Button-1>")
         else:
             # Session list changed — rebuild UI
             for w in self.list_frame.winfo_children():
@@ -1704,12 +1804,8 @@ class SessionTracker:
                     tag_label = tk.Label(
                         row, text=tag, font=("Consolas", 7, "bold"),
                         fg=color, bg="#12121e",
-                        cursor="hand2" if status == "approval" else "",
                     )
                     tag_label.pack(side="right")
-                    if status == "approval":
-                        tag_label.bind("<Button-1>",
-                            lambda e, sess=s: self._approve_session(sess))
 
                     # Per-session auto-approve button
                     aa = self._auto_approve_sessions.get(sid, self._auto_approve_global)
@@ -1735,7 +1831,12 @@ class SessionTracker:
         self._schedule_refresh()
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            # Always hand the user's settings files back to their baseline,
+            # however the app exits (close button, restart, crash in the loop).
+            self._restore_all_managed()
 
 
 def _ensure_startup_shortcut():
@@ -1745,7 +1846,14 @@ def _ensure_startup_shortcut():
             r"Microsoft\Windows\Start Menu\Programs\Startup"
         if not startup.exists():
             return
-        link = startup / "ClaudeSessionTracker.vbs"
+        # Remove the old shortcut from when this was "Session Tracker"
+        old_link = startup / "ClaudeSessionTracker.vbs"
+        if old_link.exists():
+            try:
+                old_link.unlink()
+            except OSError:
+                pass
+        link = startup / "ClaudeSessionManager.vbs"
         # Find pythonw.exe for silent launch
         d = os.path.dirname(sys.executable)
         pythonw = os.path.join(d, "pythonw.exe")
@@ -1758,7 +1866,7 @@ def _ensure_startup_shortcut():
             f'Set folder = fso.GetFolder("{script_dir}")\n'
             f'best = ""\n'
             f'For Each f In folder.Files\n'
-            f'  If LCase(f.Name) Like "claude_session_tracker*.pyw" Then\n'
+            f'  If LCase(f.Name) Like "claude_session_manager*.pyw" Then\n'
             f'    If f.Name > best Then best = f.Name\n'
             f'  End If\n'
             f'Next\n'
@@ -1772,13 +1880,20 @@ def _ensure_startup_shortcut():
         pass
 
 
-CONFIG_FILE = CLAUDE_DIR / "session_tracker_config.json"
+CONFIG_FILE = CLAUDE_DIR / "session_manager_config.json"
+_OLD_CONFIG_FILE = CLAUDE_DIR / "session_tracker_config.json"
 
 def _load_config():
-    """Load config, returning dict with at least 'mode' key."""
+    """Load config, returning dict with at least 'mode' key.
+    Migrates the old session_tracker_config.json on first run."""
     try:
         if CONFIG_FILE.exists():
             return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        # Migrate settings from the old "Session Tracker" config name
+        if _OLD_CONFIG_FILE.exists():
+            cfg = json.loads(_OLD_CONFIG_FILE.read_text(encoding="utf-8"))
+            _save_config(cfg)
+            return cfg
     except Exception:
         pass
     return {}
@@ -1794,7 +1909,7 @@ def _ask_mode():
     """Show a first-launch dialog asking the user to pick session mode."""
     choice = [None]
     dlg = tk.Tk()
-    dlg.title("Claude Session Tracker — Setup")
+    dlg.title("Claude Session Manager - Setup")
     dlg.configure(bg="#12121e")
     dlg.resizable(False, False)
 
@@ -1834,29 +1949,85 @@ def _ask_mode():
 
 
 def _acquire_singleton_mutex():
-    """Create a named mutex so only one tracker runs at a time.
-    Returns the handle (keep alive for process lifetime) or None if
-    another instance already holds it after a short retry window —
-    the retry covers the brief overlap when _restart spawns a new
-    instance before the old one has exited."""
-    ERROR_ALREADY_EXISTS = 183
+    """Ensure only one tracker runs at a time. Returns the mutex handle
+    (keep alive for process lifetime) or None if another instance already
+    holds the lock. Uses OpenMutexW to probe for an existing holder, then
+    CreateMutexW to take ownership. Retries briefly so _restart's spawn
+    overlap with the exiting old instance doesn't trip the check.
+
+    Can't use GetLastError()==ERROR_ALREADY_EXISTS after CreateMutexW:
+    ctypes.windll resets the thread-local last-error between calls, so
+    that value is unreliably read back through ctypes wrappers."""
+    SYNCHRONIZE = 0x00100000
+    _kernel32.OpenMutexW.restype = ctypes.c_void_p
+    _kernel32.OpenMutexW.argtypes = [ctypes.c_ulong, ctypes.c_int,
+                                      ctypes.c_wchar_p]
     _kernel32.CreateMutexW.restype = ctypes.c_void_p
-    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    _kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_wchar_p]
+    name = "ClaudeSessionManager_Singleton_v1"
     for attempt in range(10):
-        handle = _kernel32.CreateMutexW(None, False,
-                                         "ClaudeSessionTracker_Singleton_v1")
-        if not handle:
-            return None
-        if _kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+        existing = _kernel32.OpenMutexW(SYNCHRONIZE, False, name)
+        if existing:
+            _kernel32.CloseHandle(existing)
+            time.sleep(0.3)
+            continue
+        handle = _kernel32.CreateMutexW(None, True, name)
+        if handle:
             return handle
-        _kernel32.CloseHandle(handle)
-        time.sleep(0.3)
+        return None
     return None
+
+
+def _surface_existing_window():
+    """Find the existing tracker window and bring it to a visible, on-screen
+    position. Called when the singleton check blocks a new launch so that
+    a double-click on the .pyw still produces a visible result instead of
+    silently exiting when the tracker is e.g. minimized off-screen on a
+    detached secondary monitor."""
+    u32 = ctypes.windll.user32
+    target_title = f"Session Manager v{VERSION}".lower()
+    found = [None]
+
+    WNDENUMPROC_LOCAL = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def cb(hwnd, _):
+        buf = ctypes.create_unicode_buffer(256)
+        u32.GetWindowTextW(hwnd, buf, 256)
+        if buf.value.lower() == target_title:
+            found[0] = hwnd
+            return False
+        return True
+
+    u32.EnumWindows(WNDENUMPROC_LOCAL(cb), 0)
+    hwnd = found[0]
+    if not hwnd:
+        return False
+
+    # Check if off-screen; if so, move to top-right of primary monitor.
+    class RECT(ctypes.Structure):
+        _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                     ("r", ctypes.c_long), ("b", ctypes.c_long)]
+    rc = RECT()
+    u32.GetWindowRect(hwnd, ctypes.byref(rc))
+    sw = u32.GetSystemMetrics(0)
+    sh = u32.GetSystemMetrics(1)
+    off_screen = (rc.l >= sw or rc.t >= sh or rc.r <= 0 or rc.b <= 0)
+    if off_screen:
+        w = max(rc.r - rc.l, 300)
+        h = max(rc.b - rc.t, 60)
+        u32.MoveWindow(hwnd, sw - w - 10, 10, w, h, True)
+
+    u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    u32.SetForegroundWindow(hwnd)
+    return True
 
 
 if __name__ == "__main__":
     _singleton_handle = _acquire_singleton_mutex()
     if _singleton_handle is None:
+        _surface_existing_window()
         sys.exit(0)
     try:
         _ensure_startup_shortcut()
@@ -1864,7 +2035,7 @@ if __name__ == "__main__":
         if "mode" not in cfg:
             cfg["mode"] = _ask_mode()
             _save_config(cfg)
-        SessionTracker(mode=cfg.get("mode", "window")).run()
+        SessionManager(mode=cfg.get("mode", "window")).run()
     except Exception:
         import traceback
         log = CLAUDE_DIR / "tracker_error.log"
