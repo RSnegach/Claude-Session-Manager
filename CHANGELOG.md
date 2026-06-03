@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.6.2
+
+- `THINKING` is now ironclad: a session shows `THINKING` only while its JSONL is actively growing. Once it goes idle without a blocking prompt (`APPROVE?` / `DECISION` / interrupted / rejected), it resolves to `READY` even when the last entry was not a clean `end_turn`. Fixes sessions that could stick on `THINKING` at rest.
+- Clicking a purple `DECISION` flag now focuses that session's window so you can answer the prompt. Focus happens only on click, never automatically.
+
 ## v1.6.1
 
 - Added a purple `DECISION` status for sessions blocked on a question that needs a human answer (`AskUserQuestion` or plan approval / `ExitPlanMode`). Because `bypassPermissions` only suppresses permission prompts and does not auto-answer these, they are now visually distinct from the yellow `APPROVE?` state.

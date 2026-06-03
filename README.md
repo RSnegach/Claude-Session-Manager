@@ -9,7 +9,7 @@ An always-on-top desktop widget for Windows that monitors and manages multiple [
 ## Features
 
 - **Live session tracking**: automatically discovers active Claude Code sessions by monitoring `~/.claude/projects/` JSONL files regardless of location and correlating them with running `claude.exe` processes via I/O write counters
-- **Real-time status indicators**: shows each session's state: `READY`, `THINKING`, `APPROVE?`, `DECISION`, `REJECTED`, or `INTERRUPTED`. `DECISION` (purple) flags a session blocked on a question that needs a human answer (`AskUserQuestion` or plan approval) — these are *not* auto-answered by bypass mode, so they stand apart from routine `APPROVE?` permission prompts
+- **Real-time status indicators**: shows each session's state: `READY`, `THINKING`, `APPROVE?`, `DECISION`, `REJECTED`, or `INTERRUPTED`. `THINKING` shows only while a session's JSONL is actively growing; once it goes idle without a blocking prompt it resolves to `READY`, so it never gets stuck. `DECISION` (purple) flags a session blocked on a question that needs a human answer (`AskUserQuestion` or plan approval) — these are *not* auto-answered by bypass mode, so they stand apart from routine `APPROVE?` permission prompts; click the purple flag to jump to that session's window
 - **Auto-approve via permission mode**: the green **A** button sets a session's `permissions.defaultMode` to `bypassPermissions` (runs every tool call without prompting) when on, and back to `default` when off. Claude Code reloads this live, so there are no missed or duplicated keypresses and no accidental top-choice selection on dropdown prompts. The header toggle flips every session at once; each row's **A** overrides per session. Settings writes are merge-only (your allow-lists are preserved) and the original `defaultMode` is restored on toggle-off, session close, and app exit. Note: permission mode is scoped to the working directory, so sessions launched from the **same folder** share one auto-approve state
 - **Click to focus**: click any session row to bring its terminal window to the foreground (uses `AttachConsole`/`SetForegroundWindow`, with `UIAutomation` tab-switching fallback in tab mode)
 - **Inline rename**: pencil icon opens an inline editor; commits via `/rename` to the Claude process and persists in `~/.claude/history.jsonl`
@@ -47,6 +47,7 @@ The widget appears in the top-right corner of your screen. It auto-discovers any
 | Control | Action |
 |---------|--------|
 | **Session name** | Click to focus that session's terminal |
+| **DECISION flag** | Click the purple flag to focus that session's window so you can answer the pending question |
 | **✏️ (pencil)** | Rename the session |
 | **✕ (per-row)** | Hide the session from the manager |
 | **+** | Launch a new Claude Code session |

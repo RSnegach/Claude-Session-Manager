@@ -1,8 +1,16 @@
 """
-Claude Code Session Manager v1.6.1
+Claude Code Session Manager v1.6.2
 Small always-on-top widget that monitors active Claude Code sessions.
 Shows the N most recently active sessions (where N = claude.exe process count).
 Click session name to focus its terminal. Pencil icon to rename.
+
+CHANGELOG v1.6.2:
+- THINKING is now ironclad: a session shows THINKING only while its JSONL is
+  actively growing. Once it goes idle without a blocking prompt, it resolves
+  to READY even if the last entry wasn't a clean end_turn (fixes sessions
+  stuck on THINKING at rest).
+- Clicking a purple DECISION flag now focuses that session's window so you
+  can answer the prompt (focus only happens on click, never automatically).
 
 CHANGELOG v1.6.1:
 - Added a purple DECISION status for sessions blocked on a question that
@@ -33,7 +41,7 @@ CHANGELOG v1.5.0:
 - Subagents now inherit parent session's PID for key sending
 """
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 import sys
 import os
@@ -120,6 +128,15 @@ if k.AttachConsole(pid):
 # answer. bypassPermissions does NOT auto-answer these, so they get a
 # distinct "decision" status instead of "approval".
 DECISION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+
+# A session is only "thinking" while its JSONL is actively growing. If it has
+# been quiet at least this long and is not in a blocking state (decision /
+# approval / interrupted / rejected), it is at rest -> "ready". This keeps
+# THINKING honest: it never lingers on a session that has gone idle with an
+# unclean / non-end_turn last entry. Refresh runs every 500ms and streaming
+# writes are sub-second, so a genuinely working session always re-grows well
+# within this window.
+THINKING_IDLE_SECONDS = 3
 
 # Titles that indicate "no custom name set"
 _DEFAULT_TITLES = {"claude code", ""}
@@ -1252,22 +1269,32 @@ class SessionManager:
         if interrupted:
             return "interrupted"
 
-        if last_type == "assistant" and stop_reason == "end_turn":
-            return "ready"
-
         # A pending question/plan-approval needs a HUMAN answer — bypass
         # permission mode does NOT auto-answer these, so flag them distinctly.
+        # Checked before end_turn/thinking because these block with no further
+        # file growth and must persist while waiting.
         if tool_use_is_last and any(
             n in DECISION_TOOLS for n in pending_tool_names
         ):
             return "decision"
 
-        # tool_use detected in content (either via stop_reason or content blocks)
+        # tool_use detected in content (either via stop_reason or content
+        # blocks) — a permission prompt is pending. Also a blocking state, so
+        # it is not subject to the idle->ready rule below.
         if tool_use_is_last:
             return "approval"
 
-        # Everything else (user message, streaming, etc.) → still working
-        return "thinking"
+        # Clean end of turn — at rest.
+        if last_type == "assistant" and stop_reason == "end_turn":
+            return "ready"
+
+        # Not blocked and not a clean end_turn. The ONLY thing that tells
+        # "thinking" apart from "at rest with an unclean last entry" is whether
+        # the JSONL is still actively growing. If it has gone quiet, the
+        # session is at rest -> ready; otherwise it is genuinely working.
+        if since_growth <= THINKING_IDLE_SECONDS:
+            return "thinking"
+        return "ready"
 
     def _scan_sessions(self):
         """Find active sessions and update PID mapping via I/O correlation."""
@@ -1770,7 +1797,15 @@ class SessionManager:
                 widgets["dot"].delete("all")
                 widgets["dot"].create_oval(0, 0, 8, 8, fill=color, outline=color)
                 widgets["name"].configure(text=dn)
-                widgets["tag"].configure(text=tag, fg=color)
+                # Clicking a DECISION flag focuses that session's window so you
+                # can answer the prompt. Rebind every cycle since status changes.
+                if status == "decision":
+                    widgets["tag"].configure(text=tag, fg=color, cursor="hand2")
+                    widgets["tag"].bind("<Button-1>",
+                        lambda e, sess=s: self._focus_session(sess))
+                else:
+                    widgets["tag"].configure(text=tag, fg=color, cursor="")
+                    widgets["tag"].unbind("<Button-1>")
                 # Update per-session auto-approve button
                 aa = self._auto_approve_sessions.get(sid, self._auto_approve_global)
                 widgets["aa"].configure(
@@ -1828,8 +1863,13 @@ class SessionManager:
                     tag_label = tk.Label(
                         row, text=tag, font=("Consolas", 7, "bold"),
                         fg=color, bg="#12121e",
+                        cursor="hand2" if status == "decision" else "",
                     )
                     tag_label.pack(side="right")
+                    # Clicking a DECISION flag focuses that session's window.
+                    if status == "decision":
+                        tag_label.bind("<Button-1>",
+                            lambda e, sess=s: self._focus_session(sess))
 
                     # Per-session auto-approve button
                     aa = self._auto_approve_sessions.get(sid, self._auto_approve_global)
