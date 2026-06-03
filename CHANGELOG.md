@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## v1.6.1
+
+- Added a purple `DECISION` status for sessions blocked on a question that needs a human answer (`AskUserQuestion` or plan approval / `ExitPlanMode`). Because `bypassPermissions` only suppresses permission prompts and does not auto-answer these, they are now visually distinct from the yellow `APPROVE?` state.
+
 ## v1.6.0
 
 - Replaced keystroke-based auto-approve with permission-mode control. The green **A** now sets a session's project `permissions.defaultMode` to `bypassPermissions` (auto-approve everything, no prompts) when on, and `default` (normal prompting) when off. Claude Code reloads this live.

@@ -1,8 +1,14 @@
 """
-Claude Code Session Manager v1.6.0
+Claude Code Session Manager v1.6.1
 Small always-on-top widget that monitors active Claude Code sessions.
 Shows the N most recently active sessions (where N = claude.exe process count).
 Click session name to focus its terminal. Pencil icon to rename.
+
+CHANGELOG v1.6.1:
+- Added a purple DECISION status for sessions blocked on a question that
+  needs a human answer (AskUserQuestion / plan approval). bypassPermissions
+  does NOT auto-answer these, so they are now visually distinct from the
+  yellow APPROVE? permission prompts.
 
 CHANGELOG v1.6.0:
 - Replaced keystroke-based auto-approve with permission-mode control.
@@ -27,7 +33,7 @@ CHANGELOG v1.5.0:
 - Subagents now inherit parent session's PID for key sending
 """
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 import sys
 import os
@@ -109,6 +115,11 @@ if k.AttachConsole(pid):
   u.AttachThreadInput(cur,tgt,False)
  k.FreeConsole()
 '''
+
+# Tool calls that ask the USER a question and block waiting for a human
+# answer. bypassPermissions does NOT auto-answer these, so they get a
+# distinct "decision" status instead of "approval".
+DECISION_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
 # Titles that indicate "no custom name set"
 _DEFAULT_TITLES = {"claude code", ""}
@@ -1159,6 +1170,7 @@ class SessionManager:
                 interrupted = False
                 rejected = False
                 tool_use_is_last = False
+                pending_tool_names = []  # tool names in the last pending turn
                 for line in f:
                     try:
                         entry = json.loads(line)
@@ -1170,28 +1182,30 @@ class SessionManager:
                             rejected = False  # only reset on new assistant turn
                         if t == "assistant":
                             last_stop_reason = entry.get("message", {}).get("stop_reason")
+                            content = entry.get("message", {}).get("content", [])
+                            tool_names = [
+                                b.get("name")
+                                for b in content
+                                if isinstance(b, dict) and b.get("type") == "tool_use"
+                            ] if isinstance(content, list) else []
                             if last_stop_reason == "tool_use":
                                 tool_use_is_last = True
+                                if tool_names:
+                                    pending_tool_names = tool_names
                             else:
                                 # Claude Code writes tool_use content with
                                 # stop_reason=None while approval is pending;
                                 # only sets stop_reason="tool_use" after approval.
                                 # Detect pending approval by checking content blocks.
-                                content = entry.get("message", {}).get("content", [])
-                                has_tool_use = (
-                                    isinstance(content, list)
-                                    and any(
-                                        isinstance(b, dict) and b.get("type") == "tool_use"
-                                        for b in content
-                                    )
-                                )
                                 # Only set to True if tool_use detected, don't reset to False
                                 # This preserves approval state even if thinking blocks appear after
-                                if has_tool_use:
+                                if tool_names:
                                     tool_use_is_last = True
+                                    pending_tool_names = tool_names
                         elif tool_use_is_last and t == "user":
-                            # Tool result (user entry) means it was approved
+                            # Tool result (user entry) means it was approved/answered
                             tool_use_is_last = False
+                            pending_tool_names = []
                         if t == "user":
                             content = entry.get("message", {}).get("content", "")
                             flat = ""
@@ -1214,9 +1228,10 @@ class SessionManager:
                                 rejected = True
                     except (json.JSONDecodeError, KeyError):
                         continue
-            return last_type, last_stop_reason, interrupted, rejected, tool_use_is_last
+            return (last_type, last_stop_reason, interrupted, rejected,
+                    tool_use_is_last, pending_tool_names)
         except Exception:
-            return None, None, False, False, False
+            return None, None, False, False, False, []
 
     def _get_session_status(self, session_id, jsonl_path):
         """Determine session status based on JSONL content."""
@@ -1225,8 +1240,8 @@ class SessionManager:
         last_grew = tracker.get("last_grew", 0)
         since_growth = now - last_grew if last_grew else 999
 
-        last_type, stop_reason, interrupted, rejected, tool_use_is_last = \
-            self._read_tail_status(jsonl_path)
+        last_type, stop_reason, interrupted, rejected, tool_use_is_last, \
+            pending_tool_names = self._read_tail_status(jsonl_path)
 
         if rejected:
             # Only persist "rejected" if session has been idle — otherwise
@@ -1239,6 +1254,13 @@ class SessionManager:
 
         if last_type == "assistant" and stop_reason == "end_turn":
             return "ready"
+
+        # A pending question/plan-approval needs a HUMAN answer — bypass
+        # permission mode does NOT auto-answer these, so flag them distinctly.
+        if tool_use_is_last and any(
+            n in DECISION_TOOLS for n in pending_tool_names
+        ):
+            return "decision"
 
         # tool_use detected in content (either via stop_reason or content blocks)
         if tool_use_is_last:
@@ -1712,6 +1734,7 @@ class SessionManager:
             "ready": "#00dd77",
             "thinking": "#4499ff",
             "approval": "#ffcc00",
+            "decision": "#bb66ff",
             "rejected": "#ff8844",
             "interrupted": "#ff4444",
             "error": "#ff4444",
@@ -1720,6 +1743,7 @@ class SessionManager:
             "ready": "READY",
             "thinking": "THINKING",
             "approval": "APPROVE?",
+            "decision": "DECISION",
             "rejected": "REJECTED",
             "interrupted": "INTERRUPTED",
             "error": "ERROR",
